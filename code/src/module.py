@@ -77,4 +77,4 @@ def get_stim_times(trials, stim_name, block, outcome=None):
     mask = (trials.stim_name == stim_name) & (trials.rewarded_modality == block)
     if outcome is not None:
         mask &= trials[outcome]
-    return trials.loc[mask, 'stim_start_time'].values, mask
+    return mask
