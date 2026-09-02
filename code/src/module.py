@@ -50,7 +50,8 @@ from matplotlib import pyplot as plt
 from sklearn.metrics import confusion_matrix
 from sklearn.svm import LinearSVC
 from sklearn.model_selection import (
-    train_test_split, cross_val_score, cross_val_predict)
+    train_test_split, cross_val_score, cross_val_predict,
+    permutation_test_score)
 
 def plot_confusion(y_true, y_pred, label_array, title):
     count_array = confusion_matrix(y_true, y_pred, labels=label_array)          # raw counts
@@ -76,8 +77,10 @@ def plot_confusion(y_true, y_pred, label_array, title):
     fig.tight_layout()
     plt.show()
 
-def get_stim_times(trials, stim_name, block, outcome=None):
-    mask = (trials.stim_name == stim_name) & (trials.rewarded_modality == block)
+def get_stim_times(trials, stim_name, block, outcome=None, match_block=True):
+    mask = trials.stim_name == stim_name
+    if match_block:
+        mask &= trials.rewarded_modality == block
     if outcome is not None:
         mask &= trials[outcome]
     return mask
@@ -104,6 +107,13 @@ def decode_trial_identity(
     cv=5,
     max_iter=5000,
     random_state=0,
+    n_permutations=200,
+    n_importance_repeats=10,
+    importance_top_frac=0.10,
+    importance_test_size=0.25,
+    stim_pair=None,
+    class_outcomes=None,
+    match_block=True,
     mouse_id=None,
 ):
     """Decode which stimulus was shown on each trial from population spike counts.
@@ -151,7 +161,38 @@ def decode_trial_identity(
     max_iter : int
         ``LinearSVC`` iteration cap.
     random_state : int
-        Seeds unit/trial subsampling, the train/test split, and the SVM.
+        Seeds unit/trial subsampling, the train/test split, the SVM, and the
+        label shuffles used to build the chance distribution.
+    n_permutations : int
+        Number of times the class labels are shuffled to estimate the chance
+        level empirically. For each shuffle the full cross-validation is re-run
+        on the permuted labels; ``chance`` is the mean of that null
+        distribution. Set to 0 to skip the permutation test and fall back to
+        the majority-class fraction.
+    n_importance_repeats : int
+        Number of independent stratified train/test splits used for the
+        feature-importance analysis. For each repeat a fresh SVM is fit on the
+        train trials, scored on the test trials, and its top
+        ``importance_top_frac`` of neurons (by absolute weight) are flagged as
+        important. Set to 0 to skip this analysis.
+    importance_top_frac : float
+        Fraction of neurons flagged as important in each repeat, fixed in
+        advance (e.g. 0.10 flags the top 10% by ``|w_r|``).
+    importance_test_size : float
+        Held-out fraction in each importance repeat's train/test split.
+    stim_pair : (str, str), optional
+        The two ``stim_name`` values to decode. Defaults to the block's
+        target / distractor target stimuli (``_BLOCK_STIM[block]``). Pass e.g.
+        ``('sound2', 'vis2')`` to build a non-target stimulus decoder.
+    class_outcomes : (str, str) or (None, None), optional
+        Per-class boolean trial columns to filter on. Defaults follow
+        ``outcome_filter`` (``('is_hit', 'is_false_alarm')`` when it is 1).
+        Pass ``('is_correct_reject', 'is_correct_reject')`` to restrict both
+        classes to trials where licking was correctly withheld.
+    match_block : bool
+        If True (default) only trials with ``rewarded_modality == block`` are
+        used. Set False to pool a stimulus across every task block (e.g. a
+        non-target decoder run in both the visual and auditory blocks).
     mouse_id : hashable, optional
         Copied into the result dict for bookkeeping in the loop.
 
@@ -161,11 +202,32 @@ def decode_trial_identity(
         Always contains ``mouse_id``, ``region``, ``block``, ``n_units``,
         ``n_rew_trials``, ``n_unrew_trials``, ``n_trials`` and ``status``.
         When ``status == 'ok'`` it also contains ``split_accuracy``,
-        ``cv_accuracy_mean``, ``cv_accuracy_folds`` (array), ``chance``,
+        ``cv_accuracy_mean``, ``cv_accuracy_folds`` (array), ``chance``
+        (mean of the label-shuffle null distribution), ``chance_std`` (its
+        standard deviation), ``chance_p`` (permutation p-value: fraction of
+        shuffles whose accuracy was >= the observed accuracy),
+        ``null_accuracy`` (the ``n_permutations``-long array of shuffled-label
+        accuracies), ``chance_majority_class`` (the old majority-class
+        fraction, kept for reference),
         ``confusion_matrix`` (2x2 array of counts, cross-validated),
         ``confusion_labels`` (``[rew_stim, unrew_stim]``), ``coef_weights``
         (abs SVM weight per unit, from a fit on all rows), ``unit_ids``
         (index into ``units`` for each column) and ``n_cv_folds``.
+
+        The repeated-split feature-importance analysis adds (all per-unit
+        arrays aligned with ``unit_ids``): ``rep_accuracy`` (test accuracy of
+        each repeat), ``rep_accuracy_mean`` / ``rep_accuracy_std``,
+        ``weight_abs_mean`` / ``weight_abs_std`` (mean and SD of ``|w_r|``
+        across repeats), ``weight_stability`` (fraction of repeats in which the
+        unit was flagged as important -- the feature-importance ranking),
+        ``n_flagged_per_rep`` (how many units are flagged each repeat),
+        ``single_unit_stat`` (circularity-safe firing statistic: for each unit
+        the mean over repeats in which it was flagged *and* had held-out
+        trials of both classes, of ``mean rate on hit trials - mean rate on
+        FA trials`` computed on that repeat's test trials only), and
+        ``single_unit_stat_n_reps`` (number of repeats contributing to each
+        unit's ``single_unit_stat``).
+
         Otherwise the metric keys are ``None`` and ``status`` explains why
         (``'insufficient_units'`` or ``'insufficient_trials'``).
     """
@@ -173,7 +235,19 @@ def decode_trial_identity(
         raise ValueError("block must be 'aud' or 'vis', got %r" % (block,))
     if decode_bin_edge_array is None:
         decode_bin_edge_array = np.arange(-0.3, 2.0, 0.1)
-    rew_stim, unrew_stim = _BLOCK_STIM[block]
+    # the two stimulus classes to decode; default = the block's target /
+    # non-target target stimuli (sound1 vs vis1 style). ``stim_pair`` overrides
+    # this, e.g. ('sound2', 'vis2') for a non-target stimulus decoder.
+    rew_stim, unrew_stim = stim_pair if stim_pair is not None else _BLOCK_STIM[block]
+    # per-class trial-outcome filter. Default follows ``outcome_filter``
+    # (hits vs false alarms). Pass e.g. ('is_correct_reject', 'is_correct_reject')
+    # to decode from trials where licking was correctly withheld.
+    if class_outcomes is not None:
+        outcome_a, outcome_b = class_outcomes
+    elif outcome_filter == 1:
+        outcome_a, outcome_b = 'is_hit', 'is_false_alarm'
+    else:
+        outcome_a, outcome_b = None, None
     rng = np.random.default_rng(random_state)
 
     result = {
@@ -190,10 +264,25 @@ def decode_trial_identity(
         'cv_accuracy_folds': None,
         'n_cv_folds': None,
         'chance': None,
+        'chance_std': None,
+        'chance_p': None,
+        'chance_majority_class': None,
+        'null_accuracy': None,
         'confusion_matrix': None,
         'confusion_labels': [rew_stim, unrew_stim],
+        'classes': [rew_stim, unrew_stim],
+        'match_block': match_block,
         'coef_weights': None,
         'unit_ids': None,
+        'rep_accuracy': None,
+        'rep_accuracy_mean': None,
+        'rep_accuracy_std': None,
+        'weight_abs_mean': None,
+        'weight_abs_std': None,
+        'weight_stability': None,
+        'n_flagged_per_rep': None,
+        'single_unit_stat': None,
+        'single_unit_stat_n_reps': None,
     }
 
     # --- units: default QC, in this region, optionally subsampled ------------
@@ -211,15 +300,12 @@ def decode_trial_identity(
     result['n_units'] = len(region_units)
     result['unit_ids'] = region_units.index.to_numpy()
 
-    # --- trials: two stimulus classes in this block, optional outcome filter -
+    # --- trials: two stimulus classes, optional block match + outcome filter -
     trials = nwbfile.trials.to_dataframe()
-    if outcome_filter == 1:
-        rew_mask = get_stim_times(trials, rew_stim, block, 'is_hit').to_numpy()
-        unrew_mask = get_stim_times(
-            trials, unrew_stim, block, 'is_false_alarm').to_numpy()
-    else:
-        rew_mask = get_stim_times(trials, rew_stim, block).to_numpy()
-        unrew_mask = get_stim_times(trials, unrew_stim, block).to_numpy()
+    rew_mask = get_stim_times(
+        trials, rew_stim, block, outcome_a, match_block=match_block).to_numpy()
+    unrew_mask = get_stim_times(
+        trials, unrew_stim, block, outcome_b, match_block=match_block).to_numpy()
 
     required_trials = (n_trials if n_trials is not None
                        else min_trials_per_class)
@@ -252,10 +338,21 @@ def decode_trial_identity(
         population_tensor[:, :, window_bin_slice], axis=2).T
     assert population_count_array.shape[0] == len(decode_label_array)
 
+    # spike counts -> firing rate (Hz) over the decode window, for the
+    # single-unit firing statistic
+    _start = window_bin_slice.start or 0
+    _stop = (window_bin_slice.stop if window_bin_slice.stop is not None
+             else len(decode_bin_edge_array) - 1)
+    window_duration = float(decode_bin_edge_array[_stop]
+                            - decode_bin_edge_array[_start])
+    population_rate_array = population_count_array / window_duration
+
     # --- decode -----------------------------------------------------------
     stim_name_array = np.array([rew_stim, unrew_stim])
     _, class_counts = np.unique(decode_label_array, return_counts=True)
-    result['chance'] = class_counts.max() / class_counts.sum()
+    result['chance_majority_class'] = class_counts.max() / class_counts.sum()
+    # provisional; replaced by the label-shuffle estimate below when CV runs
+    result['chance'] = result['chance_majority_class']
 
     x_train, x_test, y_train, y_test = train_test_split(
         population_count_array, decode_label_array,
@@ -278,12 +375,106 @@ def decode_trial_identity(
         result['confusion_matrix'] = confusion_matrix(
             decode_label_array, cv_pred, labels=stim_name_array)
 
-    # weights come from a fit on every trial (as in the notebook)
+        # empirical chance: shuffle the hit / false-alarm labels n_permutations
+        # times and re-run the same cross-validation on each shuffle.
+        if n_permutations and n_permutations > 0:
+            _, null_scores, perm_p = permutation_test_score(
+                LinearSVC(max_iter=max_iter, random_state=random_state),
+                population_count_array, decode_label_array,
+                cv=n_folds, n_permutations=n_permutations,
+                random_state=random_state, n_jobs=-1)
+            result['null_accuracy'] = null_scores
+            result['chance'] = float(null_scores.mean())
+            result['chance_std'] = float(null_scores.std(ddof=1))
+            result['chance_p'] = float(perm_p)
+
+    # reference: weights from a single fit on every trial (as in the notebook)
     full_svc = LinearSVC(max_iter=max_iter, random_state=random_state)
     full_svc.fit(population_count_array, decode_label_array)
     result['coef_weights'] = np.abs(full_svc.coef_.ravel())
 
+    # repeated train/test splits: per-repeat weights, flagged "important"
+    # neurons, and a circularity-safe single-unit firing statistic computed
+    # only on each repeat's held-out trials
+    if n_importance_repeats and n_importance_repeats > 0:
+        result.update(_repeated_split_importance(
+            population_count_array, population_rate_array, decode_label_array,
+            rew_stim=rew_stim, unrew_stim=unrew_stim,
+            n_repeats=n_importance_repeats, top_frac=importance_top_frac,
+            test_size=importance_test_size, max_iter=max_iter,
+            random_state=random_state))
+
     return result
+
+
+def _repeated_split_importance(count_array, rate_array, label_array, *,
+                               rew_stim, unrew_stim, n_repeats, top_frac,
+                               test_size, max_iter, random_state):
+    """Repeated stratified train/test splits for feature importance.
+
+    For each repeat ``r``:
+
+    1. split trials into train/test (stratified, seed ``random_state + r``);
+    2. fit a linear SVM on train -> weight vector ``w_r``;
+    3. score accuracy on test -> ``accuracy_r``;
+    4. flag the ``top_frac`` neurons with the largest ``|w_r|`` as important;
+    5. on that repeat's test trials only, compute the single-unit statistic
+       (mean firing rate on hit trials - mean rate on false-alarm trials) for
+       the flagged neurons.
+
+    Returns per-neuron arrays aligned with the columns of ``count_array``:
+    ``weight_stability`` (fraction of repeats flagged), ``weight_abs_mean`` /
+    ``weight_abs_std``, ``single_unit_stat`` (mean of step 5 across the repeats
+    where the neuron was both flagged and had test trials of both classes) and
+    ``single_unit_stat_n_reps``; plus ``rep_accuracy`` and summaries.
+    """
+    n_trials, n_units = count_array.shape
+    n_flag = max(1, int(np.ceil(top_frac * n_units)))
+
+    rep_acc = np.full(n_repeats, np.nan)
+    abs_w = np.zeros((n_repeats, n_units))
+    flagged = np.zeros((n_repeats, n_units), dtype=bool)
+    su_stat = np.full((n_repeats, n_units), np.nan)  # per (repeat, neuron)
+
+    for r in range(n_repeats):
+        x_tr, x_te, y_tr, y_te, rate_tr, rate_te = train_test_split(
+            count_array, label_array, rate_array,
+            test_size=test_size, stratify=label_array,
+            random_state=random_state + r)
+
+        svc = LinearSVC(max_iter=max_iter, random_state=random_state)
+        svc.fit(x_tr, y_tr)
+        rep_acc[r] = svc.score(x_te, y_te)
+
+        w = np.abs(svc.coef_.ravel())
+        abs_w[r] = w
+        cutoff = np.partition(w, n_units - n_flag)[n_units - n_flag]
+        flag_r = w >= cutoff
+        flagged[r] = flag_r
+
+        hit_te = y_te == rew_stim
+        fa_te = y_te == unrew_stim
+        if hit_te.any() and fa_te.any():
+            diff = (rate_te[hit_te].mean(axis=0)
+                    - rate_te[fa_te].mean(axis=0))
+            su_stat[r, flag_r] = diff[flag_r]
+
+    su_mean = np.full(n_units, np.nan)
+    has_data = np.any(~np.isnan(su_stat), axis=0)
+    su_mean[has_data] = np.nanmean(su_stat[:, has_data], axis=0)
+
+    ddof = 1 if n_repeats > 1 else 0
+    return {
+        'rep_accuracy': rep_acc,
+        'rep_accuracy_mean': float(np.nanmean(rep_acc)),
+        'rep_accuracy_std': float(np.nanstd(rep_acc, ddof=ddof)),
+        'weight_abs_mean': abs_w.mean(axis=0),
+        'weight_abs_std': abs_w.std(axis=0, ddof=ddof),
+        'weight_stability': flagged.mean(axis=0),
+        'n_flagged_per_rep': int(n_flag),
+        'single_unit_stat': su_mean,
+        'single_unit_stat_n_reps': np.sum(~np.isnan(su_stat), axis=0),
+    }
 
 
 def _subsample_mask(mask, n, rng):
