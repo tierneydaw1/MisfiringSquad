@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(timeout 600 python -c ' *)",
+      "Bash(mkdir -p /tmp/claude-0/-root-capsule/8c8dd805-c66e-4f9b-b6cd-47578d978131/scratchpad)",
+      "Bash(python -c ' *)",
+      "Bash(find /root/capsule -name \"module*.py\" -o -name \"*.py\" -path \"*src*\" | head -50; echo \"---\"; ls /root/capsule/code/src/ 2>/dev/null; ls /code/src 2>/dev/null)",
+      "Read(//code/src/**)"
+    ]
+  }
+}
