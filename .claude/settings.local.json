@@ -6,7 +6,19 @@
       "Bash(python -c ' *)",
       "Bash(find /root/capsule -name \"module*.py\" -o -name \"*.py\" -path \"*src*\" | head -50; echo \"---\"; ls /root/capsule/code/src/ 2>/dev/null; ls /code/src 2>/dev/null)",
       "Read(//code/src/**)",
-      "Bash(jupyter nbconvert *)"
+      "Bash(jupyter nbconvert *)",
+      "Bash(python -c \"import nbformat; print\\(nbformat.__version__\\)\")",
+      "Bash(cp code/Decode_AcrossMiceRegions.ipynb /tmp/claude-0/-root-capsule/669b3944-20d4-4b08-bb83-e9849dbf86dc/scratchpad/nb.bak)",
+      "Bash(python /tmp/claude-0/-root-capsule/669b3944-20d4-4b08-bb83-e9849dbf86dc/scratchpad/edit_nb.py)",
+      "Bash(mkdir -p \"/tmp/claude-0/-root-capsule/ab2f70e5-0e28-4798-bcc9-270a107c95ba/scratchpad\")",
+      "Bash(python -c \"import ast,json; nb=json.load\\(open\\('code/Decode_AcrossMiceRegions.ipynb'\\)\\); ast.parse\\(''.join\\(nb['cells'][25]['source']\\)\\); print\\('cell 25 OK, type', nb['cells'][25]['cell_type']\\); print\\(nb['cells'][24]['cell_type'], nb['cells'][26]['cell_type']\\)\")",
+      "Bash(python -m json.tool code/Decode_AcrossMiceRegions.ipynb)",
+      "Bash(python -)",
+      "Bash(git -C /root/capsule diff --stat)",
+      "Bash(git stash *)",
+      "Bash(grep -n \"abs SVM weight per unit\\\\|weight_abs_mean\\\\`\\\\` \\(mean\\\\|circularity-safe\\\\|mean rate on hit\" code/src/module.py)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/module.py'\\).read\\(\\)\\); print\\('module.py syntax OK'\\)\")",
+      "Bash(python -c \"import sys;sys.path.insert\\(0,'src'\\);import importlib,module;importlib.reload\\(module\\);print\\('reload OK'\\)\")"
     ]
   }
 }
