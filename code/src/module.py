@@ -49,9 +49,24 @@ def neuron_psth(units_table, neuron_row_index, stim_time_array, psth_bin_edge_ar
 from matplotlib import pyplot as plt
 from sklearn.metrics import confusion_matrix
 from sklearn.svm import LinearSVC
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
 from sklearn.model_selection import (
     train_test_split, cross_val_score, cross_val_predict,
     permutation_test_score)
+
+
+def _make_svc(max_iter=5000, random_state=0):
+    """The decoder used everywhere in this module: a linear SVM on **z-scored**
+    features -- ``StandardScaler`` followed by ``LinearSVC``. Inside
+    cross-validation / repeated splits the scaler is fit on the training fold
+    only, so the held-out trials are standardised with the training mean and SD
+    and there is no leakage. Access the fitted SVM weights with ``est[-1].coef_``.
+    """
+    return make_pipeline(
+        StandardScaler(),
+        LinearSVC(max_iter=max_iter, random_state=random_state))
+
 
 def plot_confusion(y_true, y_pred, label_array, title):
     count_array = confusion_matrix(y_true, y_pred, labels=label_array)          # raw counts
@@ -124,8 +139,11 @@ def decode_trial_identity(
 
     A linear SVM is trained on a (trials x neurons) matrix of spike counts taken
     from ``window_bin_slice`` of ``decode_bin_edge_array`` (relative to stimulus
-    onset). The two classes are the block-rewarded stimulus (e.g. ``sound1`` in
-    an auditory block) and the block-unrewarded stimulus (e.g. ``vis1``).
+    onset). Counts are **z-scored per neuron** before the SVM (``StandardScaler``
+    + ``LinearSVC``, see ``_make_svc``); inside cross-validation the scaler is
+    fit on the training fold only. The two classes are the block-rewarded
+    stimulus (e.g. ``sound1`` in an auditory block) and the block-unrewarded
+    stimulus (e.g. ``vis1``).
 
     Parameters
     ----------
@@ -211,7 +229,8 @@ def decode_trial_identity(
         fraction, kept for reference),
         ``confusion_matrix`` (2x2 array of counts, cross-validated),
         ``confusion_labels`` (``[rew_stim, unrew_stim]``), ``coef_weights``
-        (abs SVM weight per unit, from a fit on all rows), ``unit_ids``
+        (abs SVM weight per unit on the z-scored features, from a fit on all
+        rows), ``unit_ids``
         (index into ``units`` for each column) and ``n_cv_folds``.
 
         The repeated-split feature-importance analysis adds (all per-unit
@@ -357,17 +376,17 @@ def decode_trial_identity(
     x_train, x_test, y_train, y_test = train_test_split(
         population_count_array, decode_label_array,
         random_state=random_state, stratify=decode_label_array)
-    fitted_svc = LinearSVC(max_iter=max_iter, random_state=random_state)
+    fitted_svc = _make_svc(max_iter, random_state)
     fitted_svc.fit(x_train, y_train)
     result['split_accuracy'] = fitted_svc.score(x_test, y_test)
 
     n_folds = int(min(cv, class_counts.min()))
     if n_folds >= 2:
         cv_scores = cross_val_score(
-            LinearSVC(max_iter=max_iter, random_state=random_state),
+            _make_svc(max_iter, random_state),
             population_count_array, decode_label_array, cv=n_folds)
         cv_pred = cross_val_predict(
-            LinearSVC(max_iter=max_iter, random_state=random_state),
+            _make_svc(max_iter, random_state),
             population_count_array, decode_label_array, cv=n_folds)
         result['cv_accuracy_folds'] = cv_scores
         result['cv_accuracy_mean'] = cv_scores.mean()
@@ -379,7 +398,7 @@ def decode_trial_identity(
         # times and re-run the same cross-validation on each shuffle.
         if n_permutations and n_permutations > 0:
             _, null_scores, perm_p = permutation_test_score(
-                LinearSVC(max_iter=max_iter, random_state=random_state),
+                _make_svc(max_iter, random_state),
                 population_count_array, decode_label_array,
                 cv=n_folds, n_permutations=n_permutations,
                 random_state=random_state, n_jobs=-1)
@@ -389,9 +408,9 @@ def decode_trial_identity(
             result['chance_p'] = float(perm_p)
 
     # reference: weights from a single fit on every trial (as in the notebook)
-    full_svc = LinearSVC(max_iter=max_iter, random_state=random_state)
+    full_svc = _make_svc(max_iter, random_state)
     full_svc.fit(population_count_array, decode_label_array)
-    result['coef_weights'] = np.abs(full_svc.coef_.ravel())
+    result['coef_weights'] = np.abs(full_svc[-1].coef_.ravel())
 
     # repeated train/test splits: per-repeat weights, flagged "important"
     # neurons, and a circularity-safe single-unit firing statistic computed
@@ -442,11 +461,13 @@ def _repeated_split_importance(count_array, rate_array, label_array, *,
             test_size=test_size, stratify=label_array,
             random_state=random_state + r)
 
-        svc = LinearSVC(max_iter=max_iter, random_state=random_state)
+        svc = _make_svc(max_iter, random_state)
         svc.fit(x_tr, y_tr)
         rep_acc[r] = svc.score(x_te, y_te)
 
-        w = np.abs(svc.coef_.ravel())
+        # |weights| are on the z-scored features, so they are comparable across
+        # neurons regardless of firing rate
+        w = np.abs(svc[-1].coef_.ravel())
         abs_w[r] = w
         cutoff = np.partition(w, n_units - n_flag)[n_units - n_flag]
         flag_r = w >= cutoff
